@@ -215,6 +215,14 @@ class ZohoMailClient:
             "POST", f"/api/accounts/{account_id}/messages", json_body=payload
         )
 
+    async def send_draft(self, draft_message_id: str) -> dict[str, Any]:
+        account_id = await self._ensure_account_id()
+        return await self._request(
+            "POST",
+            f"/api/accounts/{account_id}/messages/{draft_message_id}",
+            json_body={"action": "send"},
+        )
+
     # ── Send & Reply ───────────────────────────────────────────────
 
     async def send_message(

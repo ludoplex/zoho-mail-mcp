@@ -100,6 +100,15 @@ async def test_list_drafts_no_folder(client, mock_api):
 
 
 @pytest.mark.asyncio
+async def test_send_draft(client, mock_api):
+    mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/d1").respond(
+        json={"status": {"code": 200}, "data": {"messageId": "d1", "status": "sent"}}
+    )
+    result = await client.send_draft("d1")
+    assert result["data"]["status"] == "sent"
+
+
+@pytest.mark.asyncio
 async def test_create_draft_minimal(client, mock_api):
     mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
         json={"status": {"code": 200}, "data": {"messageId": "d1"}}

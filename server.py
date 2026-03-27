@@ -1,4 +1,4 @@
-"""Zoho Mail MCP Server — 13 tools via FastMCP."""
+"""Zoho Mail MCP Server — 14 tools via FastMCP."""
 
 from __future__ import annotations
 
@@ -251,7 +251,29 @@ async def zoho_create_draft(
     return _fmt(result)
 
 
-# ── 9. Send Message ───────────────────────────────────────────────
+# ── 9. Send Draft ─────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def zoho_send_draft(draftMessageId: str) -> str:
+    """Sends an existing draft email immediately.
+
+    Use this after zoho_create_draft to send a previously saved draft. The draft
+    must exist and have at least a recipient (to) address to be sent successfully.
+
+    The response includes:
+    - The sent message details on success
+    - An error if the draft was not found or is missing required fields
+
+    Args:
+        draftMessageId: The message ID of the draft to send (obtained from zoho_create_draft or zoho_list_drafts)
+    """
+    assert _client is not None
+    result = await _client.send_draft(draftMessageId)
+    return _fmt(result)
+
+
+# ── 10. Send Message ─────────────────────────────────────────────
 
 
 @mcp.tool()
@@ -289,7 +311,7 @@ async def zoho_send_message(
     return _fmt(result)
 
 
-# ── 10. Reply to Message ──────────────────────────────────────────
+# ── 11. Reply to Message ──────────────────────────────────────────
 
 
 @mcp.tool()
@@ -323,7 +345,7 @@ async def zoho_reply_to_message(
     return _fmt(result)
 
 
-# ── 11. Modify Message ────────────────────────────────────────────
+# ── 12. Modify Message ────────────────────────────────────────────
 
 
 @mcp.tool()
@@ -354,7 +376,7 @@ async def zoho_modify_message(
     return _fmt(result)
 
 
-# ── 12. Delete Message ────────────────────────────────────────────
+# ── 13. Delete Message ────────────────────────────────────────────
 
 
 @mcp.tool()
@@ -370,7 +392,7 @@ async def zoho_delete_message(messageId: str, folderId: str) -> str:
     return _fmt(result)
 
 
-# ── 13. Get Attachment ─────────────────────────────────────────────
+# ── 14. Get Attachment ─────────────────────────────────────────────
 
 
 @mcp.tool()
