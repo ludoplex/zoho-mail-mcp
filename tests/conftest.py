@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import pytest_asyncio
 import respx
 import httpx
 
@@ -47,7 +48,7 @@ def token_cache() -> TokenCache:
     )
 
 
-@pytest.fixture()
+@pytest_asyncio.fixture()
 async def client(token_cache, mock_api) -> ZohoMailClient:
     c = ZohoMailClient(
         token_cache=token_cache,
