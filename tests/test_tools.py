@@ -1,4 +1,4 @@
-"""Integration tests for all 12 MCP tools against mocked Zoho API."""
+"""Integration tests for all 13 MCP tools against mocked Zoho API."""
 
 from __future__ import annotations
 
@@ -43,8 +43,17 @@ async def test_search_messages(client, mock_api):
     mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/search").respond(
         json={"status": {"code": 200}, "data": [{"messageId": "m1", "subject": "Hello"}]}
     )
-    result = await client.search_messages("Hello")
+    result = await client.search_messages(q="Hello")
     assert result["data"][0]["subject"] == "Hello"
+
+
+@pytest.mark.asyncio
+async def test_search_messages_defaults(client, mock_api):
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/search").respond(
+        json={"status": {"code": 200}, "data": []}
+    )
+    result = await client.search_messages()
+    assert result["data"] == []
 
 
 @pytest.mark.asyncio
@@ -66,12 +75,48 @@ async def test_read_thread(client, mock_api):
 
 
 @pytest.mark.asyncio
-async def test_create_draft(client, mock_api):
+async def test_list_drafts(client, mock_api):
+    # list_drafts first fetches folders to find the Drafts folder
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders").respond(
+        json={"status": {"code": 200}, "data": [
+            {"folderId": "100", "folderName": "Inbox"},
+            {"folderId": "200", "folderName": "Drafts"},
+        ]}
+    )
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/200/messages").respond(
+        json={"status": {"code": 200}, "data": [{"messageId": "d1", "subject": "My draft"}]}
+    )
+    result = await client.list_drafts()
+    assert result["data"][0]["subject"] == "My draft"
+
+
+@pytest.mark.asyncio
+async def test_list_drafts_no_folder(client, mock_api):
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders").respond(
+        json={"status": {"code": 200}, "data": [{"folderId": "100", "folderName": "Inbox"}]}
+    )
+    result = await client.list_drafts()
+    assert result["data"] == []
+
+
+@pytest.mark.asyncio
+async def test_create_draft_minimal(client, mock_api):
     mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
         json={"status": {"code": 200}, "data": {"messageId": "d1"}}
     )
-    result = await client.create_draft("to@example.com", "Draft subject", "<p>hi</p>")
+    result = await client.create_draft("Draft body")
     assert result["data"]["messageId"] == "d1"
+
+
+@pytest.mark.asyncio
+async def test_create_draft_with_thread(client, mock_api):
+    mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
+        json={"status": {"code": 200}, "data": {"messageId": "d2"}}
+    )
+    result = await client.create_draft(
+        "Reply draft", to="bob@example.com", thread_id="t1", content_type="text/html"
+    )
+    assert result["data"]["messageId"] == "d2"
 
 
 @pytest.mark.asyncio
@@ -81,6 +126,17 @@ async def test_send_message(client, mock_api):
     )
     result = await client.send_message("to@example.com", "Subject", "Body")
     assert result["data"]["messageId"] == "s1"
+
+
+@pytest.mark.asyncio
+async def test_send_message_html(client, mock_api):
+    mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
+        json={"status": {"code": 200}, "data": {"messageId": "s2"}}
+    )
+    result = await client.send_message(
+        "to@example.com", "Subject", "<p>HTML</p>", content_type="text/html"
+    )
+    assert result["data"]["messageId"] == "s2"
 
 
 @pytest.mark.asyncio

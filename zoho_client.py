@@ -85,19 +85,24 @@ class ZohoMailClient:
 
     async def search_messages(
         self,
-        query: str,
-        folder_id: str | None = None,
-        limit: int = 10,
+        *,
+        q: str = "",
+        max_results: int = 20,
         start: int = 0,
+        folder_id: str | None = None,
+        include_spam_trash: bool = False,
     ) -> dict[str, Any]:
         account_id = await self._ensure_account_id()
         params: dict[str, Any] = {
-            "searchKey": query,
-            "limit": limit,
+            "limit": max_results,
             "start": start,
         }
+        if q:
+            params["searchKey"] = q
         if folder_id:
             params["folderId"] = folder_id
+        if include_spam_trash:
+            params["includeJunk"] = "true"
         return await self._request(
             "GET", f"/api/accounts/{account_id}/messages/search", params=params
         )
@@ -149,32 +154,68 @@ class ZohoMailClient:
             f"/api/accounts/{account_id}/folders/{folder_id}/messages/{message_id}",
         )
 
-    # ── Compose & Send ─────────────────────────────────────────────
+    # ── Drafts ─────────────────────────────────────────────────────
+
+    async def list_drafts(
+        self,
+        *,
+        max_results: int = 20,
+        start: int = 0,
+    ) -> dict[str, Any]:
+        account_id = await self._ensure_account_id()
+        # Get the Drafts folder first, then list messages in it
+        folders_resp = await self._request(
+            "GET", f"/api/accounts/{account_id}/folders"
+        )
+        drafts_folder_id: str | None = None
+        for folder in folders_resp.get("data", []):
+            if folder.get("folderName", "").lower() == "drafts":
+                drafts_folder_id = str(folder["folderId"])
+                break
+        if not drafts_folder_id:
+            return {"status": {"code": 200}, "data": []}
+
+        return await self._request(
+            "GET",
+            f"/api/accounts/{account_id}/folders/{drafts_folder_id}/messages",
+            params={"limit": max_results, "start": start},
+        )
 
     async def create_draft(
         self,
-        to: str,
-        subject: str,
         body: str,
         *,
+        to: str = "",
+        subject: str = "",
         cc: str = "",
         bcc: str = "",
-        is_html: bool = True,
+        content_type: str = "text/plain",
+        thread_id: str = "",
+        folder_id: str = "",
     ) -> dict[str, Any]:
         account_id = await self._ensure_account_id()
+        is_html = content_type == "text/html"
         payload: dict[str, Any] = {
-            "toAddress": to,
-            "subject": subject,
             "content": body,
             "mailFormat": "html" if is_html else "plaintext",
         }
+        if to:
+            payload["toAddress"] = to
+        if subject:
+            payload["subject"] = subject
         if cc:
             payload["ccAddress"] = cc
         if bcc:
             payload["bccAddress"] = bcc
+        if thread_id:
+            payload["threadId"] = thread_id
+        if folder_id:
+            payload["folderId"] = folder_id
         return await self._request(
             "POST", f"/api/accounts/{account_id}/messages", json_body=payload
         )
+
+    # ── Send & Reply ───────────────────────────────────────────────
 
     async def send_message(
         self,
@@ -184,9 +225,10 @@ class ZohoMailClient:
         *,
         cc: str = "",
         bcc: str = "",
-        is_html: bool = True,
+        content_type: str = "text/plain",
     ) -> dict[str, Any]:
         account_id = await self._ensure_account_id()
+        is_html = content_type == "text/html"
         payload: dict[str, Any] = {
             "toAddress": to,
             "subject": subject,
@@ -210,10 +252,11 @@ class ZohoMailClient:
         to: str = "",
         cc: str = "",
         bcc: str = "",
-        is_html: bool = True,
+        content_type: str = "text/plain",
         reply_all: bool = False,
     ) -> dict[str, Any]:
         account_id = await self._ensure_account_id()
+        is_html = content_type == "text/html"
         payload: dict[str, Any] = {
             "content": body,
             "mailFormat": "html" if is_html else "plaintext",
