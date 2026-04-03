@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from zoho_client import ZohoMailClient, create_client_from_env
 
@@ -37,7 +38,7 @@ def _fmt(data: dict[str, Any]) -> str:
 # ── 1. Profile ────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def zoho_get_profile() -> str:
     """Retrieves your Zoho Mail profile information, including email address and account details.
 
@@ -54,7 +55,7 @@ async def zoho_get_profile() -> str:
 # ── 2. Search Messages ────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def zoho_search_messages(
     q: str = "",
     maxResults: int = 20,
@@ -101,7 +102,7 @@ async def zoho_search_messages(
 # ── 3. Read Message ───────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def zoho_read_message(messageId: str, folderId: str) -> str:
     """Retrieves the complete content and metadata of a specific Zoho Mail message including headers, body, and attachment information.
 
@@ -119,7 +120,7 @@ async def zoho_read_message(messageId: str, folderId: str) -> str:
 # ── 4. Read Thread ────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def zoho_read_thread(threadId: str, folderId: str) -> str:
     """Retrieves a complete email conversation thread including all messages in chronological order.
 
@@ -137,7 +138,7 @@ async def zoho_read_thread(threadId: str, folderId: str) -> str:
 # ── 5. List Folders ───────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def zoho_list_folders() -> str:
     """Lists all mail folders in your Zoho Mail account.
 
@@ -152,10 +153,11 @@ async def zoho_list_folders() -> str:
     return _fmt(result)
 
 
+
 # ── 6. List Labels ────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def zoho_list_labels() -> str:
     """Lists all labels/tags in your Zoho Mail account.
 
@@ -172,7 +174,7 @@ async def zoho_list_labels() -> str:
 # ── 7. List Drafts ────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def zoho_list_drafts(
     maxResults: int = 20,
     start: int = 0,
@@ -198,7 +200,7 @@ async def zoho_list_drafts(
 # ── 8. Create Draft ───────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))
 async def zoho_create_draft(
     body: str,
     to: str = "",
@@ -254,7 +256,7 @@ async def zoho_create_draft(
 # ── 9. Send Draft ─────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True))
 async def zoho_send_draft(draftMessageId: str) -> str:
     """Sends an existing draft email immediately.
 
@@ -273,10 +275,11 @@ async def zoho_send_draft(draftMessageId: str) -> str:
     return _fmt(result)
 
 
+
 # ── 10. Send Message ─────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True))
 async def zoho_send_message(
     to: str,
     subject: str,
@@ -314,7 +317,7 @@ async def zoho_send_message(
 # ── 11. Reply to Message ──────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True))
 async def zoho_reply_to_message(
     messageId: str,
     folderId: str,
@@ -348,7 +351,7 @@ async def zoho_reply_to_message(
 # ── 12. Modify Message ────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True))
 async def zoho_modify_message(
     messageId: str,
     folderId: str,
@@ -379,7 +382,7 @@ async def zoho_modify_message(
 # ── 13. Delete Message ────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True))
 async def zoho_delete_message(messageId: str, folderId: str) -> str:
     """Deletes (trashes) an email message.
 
@@ -392,10 +395,11 @@ async def zoho_delete_message(messageId: str, folderId: str) -> str:
     return _fmt(result)
 
 
+
 # ── 14. Get Attachment ─────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def zoho_get_attachment(
     messageId: str, folderId: str, attachmentId: str
 ) -> str:
