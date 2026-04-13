@@ -1,0 +1,6 @@
+interface:
+  display_name: "Zoho Mail Mcp"
+  short_description: "Repo-specific patterns and workflows for zoho-mail-mcp"
+  default_prompt: "Use the zoho-mail-mcp repo skill to follow existing architecture, testing, and workflow conventions."
+policy:
+  allow_implicit_invocation: true
