@@ -440,7 +440,7 @@ async def zoho_delete_message(messageId: str, folderId: str) -> str:
 # ── 14. Restore Message (move out of Trash) ───────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def zoho_restore_message(
     messageId: str, folderId: str, toFolderId: str = ""
 ) -> str:
