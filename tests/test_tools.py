@@ -118,13 +118,99 @@ async def test_list_drafts_no_folder(client, mock_api):
     assert result["data"] == []
 
 
-@pytest.mark.asyncio
-async def test_send_draft(client, mock_api):
-    mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/d1").respond(
-        json={"status": {"code": 200}, "data": {"messageId": "d1", "status": "sent"}}
+def _mock_draft_d1(mock_api, *, to="&quot;Bob&quot;&lt;bob@example.com&gt;", attachments=True):
+    """Zoho has no send-draft endpoint: a draft is sent by re-reading it and
+    POSTing a fresh message. These mocks model the draft's stored state."""
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders").respond(
+        json={"status": {"code": 200}, "data": [
+            {"folderId": "200", "folderName": "Drafts", "folderType": "Drafts"},
+            {"folderId": "300", "folderName": "Trash", "folderType": "Trash"},
+        ]}
     )
+    base = f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/200/messages/d1"
+    details = {
+        "messageId": "d1", "fromAddress": "test@example.com", "toAddress": to,
+        "ccAddress": "&lt;cc@example.com&gt;", "bccAddress": "Not Provided",
+        "subject": "Re: Hello &amp; welcome", "hasAttachment": "1" if attachments else "0",
+    }
+    mock_api.get(f"{base}/details").respond(json={"status": {"code": 200}, "data": details})
+    mock_api.get(f"{base}/content").respond(
+        json={"status": {"code": 200}, "data": {"messageId": "d1", "content": "<div>Hi Bob<br>bye</div>"}}
+    )
+    atts = [{"attachmentId": "a1", "attachmentName": "doc.pdf", "attachmentSize": 13}] if attachments else []
+    mock_api.get(f"{base}/attachmentinfo").respond(
+        json={"status": {"code": 200}, "data": {"messageId": "d1", "attachments": atts}}
+    )
+    mock_api.get(f"{base}/attachments/a1").respond(content=b"%PDF-1.4 fake")
+    upload = mock_api.post(
+        f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/attachments",
+        params={"fileName": "doc.pdf"},
+    ).respond(json={"status": {"code": 200}, "data": [
+        {"storeName": "st9", "attachmentPath": "/p/9", "attachmentName": "doc.pdf"},
+    ]})
+    send = mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
+        json={"status": {"code": 200}, "data": {"messageId": "s1"}}
+    )
+    trash = mock_api.put(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/updatemessage").respond(
+        json={"status": {"code": 200}}
+    )
+    return upload, send, trash
+
+
+@pytest.mark.asyncio
+async def test_send_draft_rebuilds_message_and_trashes_draft(client, mock_api):
+    upload, send, trash = _mock_draft_d1(mock_api)
     result = await client.send_draft("d1")
-    assert result["data"]["status"] == "sent"
+
+    assert result["data"]["messageId"] == "s1"
+    assert result["draftMessageId"] == "d1"
+    assert result["draftMovedToTrash"] is True
+
+    # Attachment bytes were re-uploaded to get a fresh descriptor
+    assert upload.called
+    assert upload.calls.last.request.content == b"%PDF-1.4 fake"
+
+    sent = json.loads(send.calls.last.request.content)
+    assert "mode" not in sent                      # a real send, not another draft
+    assert sent["fromAddress"] == "test@example.com"
+    assert sent["toAddress"] == '"Bob"<bob@example.com>'   # HTML entities decoded
+    assert sent["ccAddress"] == "<cc@example.com>"
+    assert "bccAddress" not in sent                # "Not Provided" is dropped
+    assert sent["subject"] == "Re: Hello & welcome"
+    assert sent["content"] == "<div>Hi Bob<br>bye</div>"
+    assert sent["mailFormat"] == "html"
+    assert sent["attachments"] == [
+        {"storeName": "st9", "attachmentPath": "/p/9", "attachmentName": "doc.pdf"}
+    ]
+
+    moved = json.loads(trash.calls.last.request.content)
+    assert moved == {"mode": "moveMessage", "destfolderId": "300", "messageId": ["d1"]}
+
+
+@pytest.mark.asyncio
+async def test_send_draft_without_attachments(client, mock_api):
+    upload, send, trash = _mock_draft_d1(mock_api, attachments=False)
+    result = await client.send_draft("d1")
+    assert result["data"]["messageId"] == "s1"
+    assert not upload.called
+    assert "attachments" not in json.loads(send.calls.last.request.content)
+
+
+@pytest.mark.asyncio
+async def test_send_draft_keep_draft(client, mock_api):
+    _, send, trash = _mock_draft_d1(mock_api)
+    result = await client.send_draft("d1", delete_after_send=False)
+    assert send.called
+    assert not trash.called
+    assert result["draftMovedToTrash"] is False
+
+
+@pytest.mark.asyncio
+async def test_send_draft_refuses_without_recipient(client, mock_api):
+    _, send, _ = _mock_draft_d1(mock_api, to="Not Provided")
+    with pytest.raises(ValueError, match="recipient"):
+        await client.send_draft("d1")
+    assert not send.called
 
 
 @pytest.mark.asyncio

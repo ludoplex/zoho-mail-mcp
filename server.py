@@ -290,9 +290,14 @@ async def zoho_send_draft(draftMessageId: str) -> str:
     Use this after zoho_create_draft to send a previously saved draft. The draft
     must exist and have at least a recipient (to) address to be sent successfully.
 
+    Zoho has no native send-draft call, so the server rebuilds the draft as a
+    fresh outgoing message (headers, body, and attachments re-uploaded) and then
+    moves the draft to Trash (reversible) so it cannot be sent twice.
+
     The response includes:
-    - The sent message details on success
-    - An error if the draft was not found or is missing required fields
+    - The sent message details on success, plus draftMessageId and
+      draftMovedToTrash
+    - An error if the draft was not found or has no recipient
 
     Args:
         draftMessageId: The message ID of the draft to send (obtained from zoho_create_draft or zoho_list_drafts)

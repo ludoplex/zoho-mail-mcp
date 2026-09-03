@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,19 @@ class ZohoMailClient:
 
         resp.raise_for_status()
         return resp.json()
+
+    async def _request_bytes(self, path: str) -> bytes:
+        """Authenticated GET returning the raw response body (attachment downloads)."""
+        self._assert_recoverable("GET", None, None)
+        headers = await self._token_cache.auth_headers(self._http)
+        url = f"{self._base_url}{path}"
+        resp = await self._http.get(url, headers=headers)
+        if resp.status_code == 401:
+            self._token_cache.invalidate()
+            headers = await self._token_cache.auth_headers(self._http)
+            resp = await self._http.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.content
 
     @staticmethod
     def _assert_recoverable(
@@ -450,13 +464,87 @@ class ZohoMailClient:
             "POST", f"/api/accounts/{account_id}/messages", json_body=payload
         )
 
-    async def send_draft(self, draft_message_id: str) -> dict[str, Any]:
+    async def send_draft(
+        self, draft_message_id: str, *, delete_after_send: bool = True
+    ) -> dict[str, Any]:
+        """Send a saved draft.
+
+        Zoho Mail's REST API has no "send this draft" operation — ``POST
+        /messages/{id}`` is *reply*, and ``mode=send`` returns HTTP 400 (verified
+        2026-09-02 against six real drafts). The only way to send a draft's
+        content is to rebuild it as a fresh message:
+
+          1. read the draft's headers (``/details``) and body (``/content``)
+          2. download each stored attachment and re-upload it to the attachment
+             store, because ``storeName``/``attachmentPath`` descriptors are not
+             retrievable from a saved draft
+          3. ``POST /messages`` (no ``mode``) — the documented send call
+          4. move the draft to Trash (reversible) so it cannot be sent twice;
+             pass ``delete_after_send=False`` to keep it
+
+        Returns the send response plus ``draftMessageId`` and
+        ``draftMovedToTrash``.
+        """
         account_id = await self._ensure_account_id()
-        return await self._request(
-            "POST",
-            f"/api/accounts/{account_id}/messages/{draft_message_id}",
-            json_body={"mode": "send"},
+        drafts_folder_id = await self._resolve_folder_id("Drafts")
+        if not drafts_folder_id:
+            raise RuntimeError("Could not resolve the Drafts folder")
+        base = (
+            f"/api/accounts/{account_id}/folders/{drafts_folder_id}"
+            f"/messages/{draft_message_id}"
         )
+        details = (await self._request("GET", f"{base}/details")).get("data", {})
+        content = (await self._request("GET", f"{base}/content")).get("data", {})
+
+        def _addr(field: str) -> str:
+            raw = str(details.get(field, "") or "").strip()
+            if not raw or raw == "Not Provided":
+                return ""
+            return html.unescape(raw)
+
+        to_addr = _addr("toAddress")
+        if not to_addr:
+            raise ValueError(
+                f"Draft {draft_message_id} has no recipient (toAddress); add one before sending."
+            )
+
+        payload: dict[str, Any] = {
+            "fromAddress": _addr("fromAddress") or await self._ensure_from_address(),
+            "toAddress": to_addr,
+            "subject": html.unescape(str(details.get("subject", "") or "")),
+            "content": str(content.get("content", "") or ""),
+            "mailFormat": "html",  # /content always returns the stored HTML rendering
+        }
+        for field in ("ccAddress", "bccAddress"):
+            value = _addr(field)
+            if value:
+                payload[field] = value
+
+        info = (await self._request("GET", f"{base}/attachmentinfo")).get("data", {})
+        descriptors: list[dict[str, Any]] = []
+        for att in info.get("attachments", []) or []:
+            att_id = str(att.get("attachmentId", ""))
+            name = str(att.get("attachmentName", "") or f"attachment-{att_id}")
+            data = await self._request_bytes(f"{base}/attachments/{att_id}")
+            uploaded = await self._request(
+                "POST",
+                f"/api/accounts/{account_id}/messages/attachments",
+                params={"fileName": name},
+                content=data,
+            )
+            got = uploaded.get("data", [])
+            descriptors.extend(got if isinstance(got, list) else [got])
+        if descriptors:
+            payload["attachments"] = descriptors
+
+        result = await self._request(
+            "POST", f"/api/accounts/{account_id}/messages", json_body=payload
+        )
+        moved = False
+        if delete_after_send:
+            await self.delete_message(draft_message_id, drafts_folder_id)
+            moved = True
+        return {**result, "draftMessageId": draft_message_id, "draftMovedToTrash": moved}
 
     # ── Send & Reply ───────────────────────────────────────────────
 
