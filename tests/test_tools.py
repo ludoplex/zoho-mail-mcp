@@ -1,4 +1,4 @@
-"""Integration tests for all 13 MCP tools against mocked Zoho API."""
+"""Integration tests for all 15 MCP tools against mocked Zoho API."""
 
 from __future__ import annotations
 
@@ -8,6 +8,16 @@ import pytest
 import respx
 
 from tests.conftest import FAKE_ACCOUNT_ID, MAIL_BASE
+
+
+def _mock_profile(mock_api):
+    """Mock the account-profile endpoint used by _ensure_from_address."""
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}").respond(
+        json={"status": {"code": 200}, "data": {
+            "accountId": FAKE_ACCOUNT_ID,
+            "emailAddress": [{"mailId": "test@example.com", "isPrimary": True}],
+        }}
+    )
 
 
 @pytest.mark.asyncio
@@ -49,7 +59,8 @@ async def test_search_messages(client, mock_api):
 
 @pytest.mark.asyncio
 async def test_search_messages_defaults(client, mock_api):
-    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/search").respond(
+    # Empty query falls back to the /messages/view folder listing
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/view").respond(
         json={"status": {"code": 200}, "data": []}
     )
     result = await client.search_messages()
@@ -58,7 +69,10 @@ async def test_search_messages_defaults(client, mock_api):
 
 @pytest.mark.asyncio
 async def test_read_message(client, mock_api):
-    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/f1/messages/m1").respond(
+    # read_message uses the /content suffix (without it Zoho 404s)
+    mock_api.get(
+        f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/f1/messages/m1/content"
+    ).respond(
         json={"status": {"code": 200}, "data": {"messageId": "m1", "content": "body text"}}
     )
     result = await client.read_message("m1", "f1")
@@ -76,18 +90,23 @@ async def test_read_thread(client, mock_api):
 
 @pytest.mark.asyncio
 async def test_list_drafts(client, mock_api):
-    # list_drafts first fetches folders to find the Drafts folder
+    # list_drafts first fetches folders to find the Drafts folder, then lists
+    # it via /messages/view?folderId= (the /folders/{id}/messages path 404s).
     mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders").respond(
         json={"status": {"code": 200}, "data": [
             {"folderId": "100", "folderName": "Inbox"},
             {"folderId": "200", "folderName": "Drafts"},
         ]}
     )
-    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/200/messages").respond(
+    view_route = mock_api.get(
+        f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/view",
+        params={"folderId": "200", "limit": 20, "start": 0},
+    ).respond(
         json={"status": {"code": 200}, "data": [{"messageId": "d1", "subject": "My draft"}]}
     )
     result = await client.list_drafts()
     assert result["data"][0]["subject"] == "My draft"
+    assert view_route.called
 
 
 @pytest.mark.asyncio
@@ -110,6 +129,7 @@ async def test_send_draft(client, mock_api):
 
 @pytest.mark.asyncio
 async def test_create_draft_minimal(client, mock_api):
+    _mock_profile(mock_api)  # create_draft resolves fromAddress first
     mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
         json={"status": {"code": 200}, "data": {"messageId": "d1"}}
     )
@@ -119,6 +139,7 @@ async def test_create_draft_minimal(client, mock_api):
 
 @pytest.mark.asyncio
 async def test_create_draft_with_thread(client, mock_api):
+    _mock_profile(mock_api)
     mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
         json={"status": {"code": 200}, "data": {"messageId": "d2"}}
     )
@@ -126,6 +147,40 @@ async def test_create_draft_with_thread(client, mock_api):
         "Reply draft", to="bob@example.com", thread_id="t1", content_type="text/html"
     )
     assert result["data"]["messageId"] == "d2"
+
+
+@pytest.mark.asyncio
+async def test_upload_attachment(client, mock_api, tmp_path):
+    file = tmp_path / "doc.pdf"
+    file.write_bytes(b"%PDF-1.4 fake")
+    upload_route = mock_api.post(
+        f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/attachments",
+        params={"fileName": "doc.pdf"},
+    ).respond(
+        json={"status": {"code": 200}, "data": [{
+            "storeName": "st1", "attachmentPath": "/p/1", "attachmentName": "doc.pdf",
+        }]}
+    )
+    result = await client.upload_attachment(str(file))
+    assert upload_route.called
+    assert upload_route.calls.last.request.content == b"%PDF-1.4 fake"
+    assert result == [
+        {"storeName": "st1", "attachmentPath": "/p/1", "attachmentName": "doc.pdf"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_draft_with_attachments(client, mock_api):
+    _mock_profile(mock_api)
+    draft_route = mock_api.post(
+        f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages"
+    ).respond(json={"status": {"code": 200}, "data": {"messageId": "d3"}})
+    meta = [{"storeName": "st1", "attachmentPath": "/p/1", "attachmentName": "doc.pdf"}]
+    result = await client.create_draft("Body", to="bob@example.com", attachments=meta)
+    assert result["data"]["messageId"] == "d3"
+    sent = json.loads(draft_route.calls.last.request.content)
+    assert sent["attachments"] == meta
+    assert sent["mode"] == "draft"
 
 
 @pytest.mark.asyncio
@@ -168,20 +223,33 @@ async def test_reply_all(client, mock_api):
 
 @pytest.mark.asyncio
 async def test_modify_message_mark_read(client, mock_api):
-    mock_api.put(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/f1/messages/m1").respond(
-        json={"status": {"code": 200}, "data": {"messageId": "m1"}}
-    )
+    # modify_message uses the bulk /updatemessage endpoint (per-message PUT 404s)
+    update_route = mock_api.put(
+        f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/updatemessage"
+    ).respond(json={"status": {"code": 200}, "data": {}})
     result = await client.modify_message("m1", "f1", is_read=True)
     assert result["status"]["code"] == 200
+    sent = json.loads(update_route.calls.last.request.content)
+    assert sent == {"mode": "markAsRead", "messageId": ["m1"]}
 
 
 @pytest.mark.asyncio
 async def test_delete_message(client, mock_api):
-    mock_api.delete(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/f1/messages/m1").respond(
-        json={"status": {"code": 200}}
+    # "Delete" is a reversible move-to-Trash via the bulk /updatemessage endpoint
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders").respond(
+        json={"status": {"code": 200}, "data": [
+            {"folderId": "300", "folderName": "Trash", "folderType": "Trash"},
+        ]}
     )
+    move_route = mock_api.put(
+        f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/updatemessage"
+    ).respond(json={"status": {"code": 200}})
     result = await client.delete_message("m1", "f1")
     assert result["status"]["code"] == 200
+    sent = json.loads(move_route.calls.last.request.content)
+    assert sent == {
+        "mode": "moveMessage", "destfolderId": "300", "messageId": ["m1"],
+    }
 
 
 @pytest.mark.asyncio

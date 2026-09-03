@@ -3,11 +3,59 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from zoho_auth import TokenCache
+
+# System folder names used for safe-delete (move-to-Trash) and restore.
+TRASH_FOLDER_NAME = "Trash"
+INBOX_FOLDER_NAME = "Inbox"
+
+
+class UnrecoverableOperationError(RuntimeError):
+    """Raised when a caller attempts an action that would permanently destroy mail.
+
+    This server intentionally forbids: permanent deletion (Zoho ``expunge=true``),
+    emptying or deleting a folder (``mode=emptyFolder`` / ``deleteFolder``), and the
+    raw HTTP ``DELETE`` verb. All "delete" intents are routed to a reversible
+    move-to-Trash instead, and Trashed mail can be restored.
+    """
+
+# Gmail-style → Zoho-style field prefix translation.
+# Lets the MCP tool accept queries written in either dialect.
+_GMAIL_TO_ZOHO = {
+    "from:": "sender:",
+    "to:": "receiver:",
+    "body:": "content:",
+}
+# Zoho search fields we recognize as already-prefixed (pass through).
+_ZOHO_FIELDS = ("entire:", "sender:", "receiver:", "subject:", "content:",
+                "folder:", "label:", "flag:", "priority:", "attachment:",
+                "newer_than:", "older_than:")
+
+
+def _normalize_search_key(q: str) -> str:
+    """Make a raw user query into a Zoho-valid searchKey.
+
+    - Translates Gmail-style prefixes (``from:`` → ``sender:``).
+    - Auto-prefixes bare keywords with ``entire:`` to avoid Zoho's 500.
+    - Leaves fully-qualified Zoho queries untouched.
+    """
+    stripped = q.strip()
+    if not stripped:
+        return stripped
+    for gmail, zoho in _GMAIL_TO_ZOHO.items():
+        if stripped.lower().startswith(gmail):
+            stripped = zoho + stripped[len(gmail):]
+            break
+    lower = stripped.lower()
+    if any(lower.startswith(f) for f in _ZOHO_FIELDS):
+        return stripped
+    # Bare keyword → search everywhere
+    return f"entire:{stripped}"
 
 
 class ZohoMailClient:
@@ -45,25 +93,73 @@ class ZohoMailClient:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        content: bytes | None = None,
         retry_on_401: bool = True,
     ) -> dict[str, Any]:
-        """Make an authenticated request to the Zoho Mail API."""
+        """Make an authenticated request to the Zoho Mail API.
+
+        ``content`` sends a raw byte payload (attachment uploads) instead of a
+        JSON body; the two are mutually exclusive.
+        """
+        self._assert_recoverable(method, params, json_body)
         headers = await self._token_cache.auth_headers(self._http)
+        if content is not None:
+            headers["Content-Type"] = "application/octet-stream"
         url = f"{self._base_url}{path}"
 
         resp = await self._http.request(
-            method, url, headers=headers, params=params, json=json_body
+            method, url, headers=headers, params=params, json=json_body,
+            content=content,
         )
 
         if resp.status_code == 401 and retry_on_401:
             self._token_cache.invalidate()
             headers = await self._token_cache.auth_headers(self._http)
             resp = await self._http.request(
-                method, url, headers=headers, params=params, json=json_body
+                method, url, headers=headers, params=params, json=json_body,
+                content=content,
             )
 
         resp.raise_for_status()
         return resp.json()
+
+    @staticmethod
+    def _assert_recoverable(
+        method: str,
+        params: dict[str, Any] | None,
+        json_body: dict[str, Any] | None,
+    ) -> None:
+        """Refuse any request that could destroy mail irrecoverably (defense-in-depth).
+
+        Blocks, regardless of which method assembled the call:
+          - HTTP ``DELETE`` (the verb Zoho uses for permanent/expunge deletion)
+          - ``expunge=true`` in query params or body (permanent delete)
+          - ``mode=emptyFolder`` / ``mode=deleteFolder`` (empties or drops a folder)
+
+        Recoverable operations — move-to-Trash and restore — go through
+        ``mode=moveMessage`` PUTs, which this guard allows.
+        """
+        if method.upper() == "DELETE":
+            raise UnrecoverableOperationError(
+                "Direct DELETE is disabled. Use delete_message (move-to-Trash) "
+                "instead; permanent deletion is not permitted by this server."
+            )
+        lowered_params = {
+            str(k).lower(): str(v).lower() for k, v in (params or {}).items()
+        }
+        if lowered_params.get("expunge") == "true":
+            raise UnrecoverableOperationError(
+                "Permanent deletion (expunge=true) is disabled by this server."
+            )
+        body = json_body or {}
+        if str(body.get("expunge", "")).lower() == "true":
+            raise UnrecoverableOperationError(
+                "Permanent deletion (expunge=true) is disabled by this server."
+            )
+        if str(body.get("mode", "")).lower() in {"emptyfolder", "deletefolder"}:
+            raise UnrecoverableOperationError(
+                "Emptying or deleting a folder (incl. Trash) is disabled by this server."
+            )
 
     # ── Account ────────────────────────────────────────────────────
 
@@ -81,6 +177,26 @@ class ZohoMailClient:
         account_id = await self._ensure_account_id()
         return await self._request("GET", f"/api/accounts/{account_id}/tags")
 
+    async def _resolve_folder_id(self, name: str) -> str | None:
+        """Find a folder's ID by its name or type (case-insensitive).
+
+        Matches Zoho's ``folderName`` or ``folderType`` (e.g. "Trash", "Inbox"),
+        tolerating localized display names where ``folderType`` is still canonical.
+        """
+        account_id = await self._ensure_account_id()
+        resp = await self._request(
+            "GET", f"/api/accounts/{account_id}/folders"
+        )
+        target = name.strip().lower()
+        for folder in resp.get("data", []):
+            candidates = {
+                str(folder.get("folderName", "")).strip().lower(),
+                str(folder.get("folderType", "")).strip().lower(),
+            }
+            if target in candidates:
+                return str(folder["folderId"])
+        return None
+
     # ── Messages ───────────────────────────────────────────────────
 
     async def search_messages(
@@ -92,26 +208,53 @@ class ZohoMailClient:
         folder_id: str | None = None,
         include_spam_trash: bool = False,
     ) -> dict[str, Any]:
+        """Search messages.
+
+        Zoho's search endpoint requires a FIELD-PREFIXED query. Bare keywords
+        return HTTP 500. Accepted prefixes include:
+
+          entire:keyword        — search all fields (body, headers, subject…)
+          sender:addr-or-name   — filter by sender
+          subject:keyword       — filter by subject
+          content:keyword       — search body only
+          receiver:addr-or-name — filter by To/Cc
+
+        If the caller passes a bare query (no colon), we auto-prefix with
+        ``entire:`` so "pearson" becomes "entire:pearson".
+
+        Gmail-style syntax (``from:`` / ``to:`` / ``body:``) is translated to
+        Zoho syntax to keep the tool forgiving for models trained on Gmail.
+
+        When ``q`` is empty, we fall back to ``/messages/view`` to list the
+        folder (``/messages/search`` 500s without a searchKey).
+        """
         account_id = await self._ensure_account_id()
-        params: dict[str, Any] = {
-            "limit": max_results,
-            "start": start,
-        }
-        if q:
-            params["searchKey"] = q
+        params: dict[str, Any] = {"limit": max_results, "start": start}
         if folder_id:
             params["folderId"] = folder_id
         if include_spam_trash:
             params["includeJunk"] = "true"
+
+        # Empty query → plain folder listing via /messages/view
+        if not q:
+            return await self._request(
+                "GET", f"/api/accounts/{account_id}/messages/view", params=params
+            )
+
+        params["searchKey"] = _normalize_search_key(q)
         return await self._request(
             "GET", f"/api/accounts/{account_id}/messages/search", params=params
         )
 
     async def read_message(self, message_id: str, folder_id: str) -> dict[str, Any]:
+        """Fetch a message's full body (HTML/plaintext content).
+
+        Zoho requires the ``/content`` suffix — without it the endpoint 404s.
+        """
         account_id = await self._ensure_account_id()
         return await self._request(
             "GET",
-            f"/api/accounts/{account_id}/folders/{folder_id}/messages/{message_id}",
+            f"/api/accounts/{account_id}/folders/{folder_id}/messages/{message_id}/content",
         )
 
     async def read_thread(self, thread_id: str, folder_id: str) -> dict[str, Any]:
@@ -130,28 +273,93 @@ class ZohoMailClient:
         is_starred: bool | None = None,
         move_to_folder_id: str | None = None,
     ) -> dict[str, Any]:
+        """Mark read/unread, star/unstar, or move a message.
+
+        Uses the bulk ``/updatemessage`` endpoint — the per-message
+        ``folders/{fid}/messages/{mid}`` PUT 404s on this tenant. Each
+        requested change is its own call (the endpoint takes one mode per
+        request). ``folder_id`` is kept for interface compatibility but the
+        bulk endpoint addresses messages by ID alone.
+        """
         account_id = await self._ensure_account_id()
-        body: dict[str, Any] = {"mode": "markAs"}
+        url = f"/api/accounts/{account_id}/updatemessage"
+        ids = [str(message_id)]
+        result: dict[str, Any] = {
+            "status": {"code": 200, "description": "no changes requested"}
+        }
 
         if is_read is not None:
-            body["isRead"] = str(is_read).lower()
+            result = await self._request(
+                "PUT", url,
+                json_body={
+                    "mode": "markAsRead" if is_read else "markAsUnread",
+                    "messageId": ids,
+                },
+            )
         if is_starred is not None:
-            body["isFlagged"] = str(is_starred).lower()
+            result = await self._request(
+                "PUT", url,
+                json_body={
+                    "mode": "setFlag",
+                    "flagid": "important" if is_starred else "flag_not_set",
+                    "messageId": ids,
+                },
+            )
         if move_to_folder_id:
-            body["mode"] = "moveMessage"
-            body["destfolderId"] = move_to_folder_id
-
-        return await self._request(
-            "PUT",
-            f"/api/accounts/{account_id}/folders/{folder_id}/messages/{message_id}",
-            json_body=body,
-        )
+            result = await self._request(
+                "PUT", url,
+                json_body={
+                    "mode": "moveMessage",
+                    "destfolderId": str(move_to_folder_id),
+                    "messageId": ids,
+                },
+            )
+        return result
 
     async def delete_message(self, message_id: str, folder_id: str) -> dict[str, Any]:
-        account_id = await self._ensure_account_id()
-        return await self._request(
-            "DELETE",
-            f"/api/accounts/{account_id}/folders/{folder_id}/messages/{message_id}",
+        """Reversibly "delete" a message by MOVING it to Trash.
+
+        This never calls Zoho's DELETE verb and never expunges, so the message
+        stays recoverable (restore it with :meth:`restore_message`).
+
+        If the message is already in Trash, the request is REFUSED — re-deleting
+        from Trash is how Zoho permanently destroys mail, which this server forbids.
+        """
+        trash_id = await self._resolve_folder_id(TRASH_FOLDER_NAME)
+        if trash_id is None:
+            raise UnrecoverableOperationError(
+                "Could not resolve the Trash folder; refusing to delete."
+            )
+        if str(folder_id) == trash_id:
+            raise UnrecoverableOperationError(
+                "Message is already in Trash. Permanent deletion / emptying Trash "
+                "is disabled by this server. Use restore_message to move it back to "
+                "the Inbox, or leave it in Trash to expire under Zoho's retention."
+            )
+        return await self.modify_message(
+            message_id, folder_id, move_to_folder_id=trash_id
+        )
+
+    async def restore_message(
+        self,
+        message_id: str,
+        folder_id: str,
+        dest_folder_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Restore a message out of Trash (or any folder) back to the Inbox.
+
+        Provide ``dest_folder_id`` to restore into a specific folder; otherwise
+        the message is moved back to the Inbox.
+        """
+        if not dest_folder_id:
+            dest_folder_id = await self._resolve_folder_id(INBOX_FOLDER_NAME)
+            if dest_folder_id is None:
+                raise RuntimeError(
+                    "Could not resolve the Inbox folder; "
+                    "pass dest_folder_id explicitly to restore."
+                )
+        return await self.modify_message(
+            message_id, folder_id, move_to_folder_id=dest_folder_id
         )
 
     # ── Drafts ─────────────────────────────────────────────────────
@@ -162,24 +370,39 @@ class ZohoMailClient:
         max_results: int = 20,
         start: int = 0,
     ) -> dict[str, Any]:
+        """List messages in the Drafts folder.
+
+        Zoho 404s on ``/folders/{id}/messages`` folder listings; the working
+        listing endpoint is ``/messages/view?folderId=`` (same one
+        ``search_messages`` uses for empty queries).
+        """
         account_id = await self._ensure_account_id()
-        # Get the Drafts folder first, then list messages in it
-        folders_resp = await self._request(
-            "GET", f"/api/accounts/{account_id}/folders"
-        )
-        drafts_folder_id: str | None = None
-        for folder in folders_resp.get("data", []):
-            if folder.get("folderName", "").lower() == "drafts":
-                drafts_folder_id = str(folder["folderId"])
-                break
+        drafts_folder_id = await self._resolve_folder_id("Drafts")
         if not drafts_folder_id:
             return {"status": {"code": 200}, "data": []}
 
         return await self._request(
             "GET",
-            f"/api/accounts/{account_id}/folders/{drafts_folder_id}/messages",
-            params={"limit": max_results, "start": start},
+            f"/api/accounts/{account_id}/messages/view",
+            params={
+                "folderId": drafts_folder_id,
+                "limit": max_results,
+                "start": start,
+            },
         )
+
+    async def _ensure_from_address(self) -> str:
+        """Cache + return the primary email for this account (required by Zoho)."""
+        if getattr(self, "_from_address", None):
+            return self._from_address  # type: ignore[attr-defined]
+        account_id = await self._ensure_account_id()
+        resp = await self._request("GET", f"/api/accounts/{account_id}")
+        data = resp.get("data", {})
+        # Prefer primary from the emailAddress array; fall back to incomingUserName
+        emails = data.get("emailAddress") or []
+        primary = next((e.get("mailId") for e in emails if e.get("isPrimary")), None)
+        self._from_address = primary or data.get("incomingUserName", "")
+        return self._from_address  # type: ignore[return-value]
 
     async def create_draft(
         self,
@@ -192,10 +415,20 @@ class ZohoMailClient:
         content_type: str = "text/plain",
         thread_id: str = "",
         folder_id: str = "",
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        """Create a draft. Zoho requires ``fromAddress`` and ``mode='draft'``.
+
+        ``attachments`` takes the descriptors returned by
+        :meth:`upload_attachment` (``storeName`` / ``attachmentPath`` /
+        ``attachmentName``) — upload first, then reference them here.
+        """
         account_id = await self._ensure_account_id()
+        from_addr = await self._ensure_from_address()
         is_html = content_type == "text/html"
         payload: dict[str, Any] = {
+            "fromAddress": from_addr,
+            "mode": "draft",
             "content": body,
             "mailFormat": "html" if is_html else "plaintext",
         }
@@ -211,6 +444,8 @@ class ZohoMailClient:
             payload["threadId"] = thread_id
         if folder_id:
             payload["folderId"] = folder_id
+        if attachments:
+            payload["attachments"] = attachments
         return await self._request(
             "POST", f"/api/accounts/{account_id}/messages", json_body=payload
         )
@@ -220,7 +455,7 @@ class ZohoMailClient:
         return await self._request(
             "POST",
             f"/api/accounts/{account_id}/messages/{draft_message_id}",
-            json_body={"action": "send"},
+            json_body={"mode": "send"},
         )
 
     # ── Send & Reply ───────────────────────────────────────────────
@@ -285,6 +520,26 @@ class ZohoMailClient:
 
     # ── Attachments ────────────────────────────────────────────────
 
+    async def upload_attachment(self, file_path: str) -> list[dict[str, Any]]:
+        """Upload a local file to Zoho's attachment store.
+
+        POSTs the raw bytes to ``/messages/attachments?fileName=`` and returns
+        the descriptor list (``storeName`` / ``attachmentPath`` /
+        ``attachmentName``) that a draft or send payload references in its
+        ``attachments`` array.
+        """
+        account_id = await self._ensure_account_id()
+        path = Path(file_path).expanduser()
+        file_bytes = path.read_bytes()
+        resp = await self._request(
+            "POST",
+            f"/api/accounts/{account_id}/messages/attachments",
+            params={"fileName": path.name},
+            content=file_bytes,
+        )
+        descriptor = resp.get("data", [])
+        return descriptor if isinstance(descriptor, list) else [descriptor]
+
     async def get_attachment(
         self, message_id: str, folder_id: str, attachment_id: str
     ) -> dict[str, Any]:
@@ -295,12 +550,49 @@ class ZohoMailClient:
         )
 
 
+def _load_credential(key: str, profile: str | None) -> str:
+    """Resolve a credential, preferring env vars, falling back to macOS Keychain.
+
+    Resolution order:
+      1. Environment variable (e.g. ``ZOHO_CLIENT_ID``) — set by caller or .env
+      2. macOS Keychain service ``zoho-mail-<profile>`` with account ``key``
+
+    Raises ``KeyError`` if neither source has a value.
+    """
+    env_val = os.environ.get(f"ZOHO_{key}")
+    if env_val:
+        return env_val
+
+    if profile:
+        try:
+            import keyring
+
+            val = keyring.get_password(f"zoho-mail-{profile}", key)
+            if val:
+                return val
+        except ImportError:
+            pass  # keyring not installed — fall through to error
+
+    raise KeyError(
+        f"ZOHO_{key} not found. Set env var ZOHO_{key} or store in Keychain "
+        f"under service 'zoho-mail-{profile or '<profile>'}' account '{key}'."
+    )
+
+
 def create_client_from_env() -> ZohoMailClient:
-    """Factory: build a ZohoMailClient from environment variables."""
+    """Factory: build a ZohoMailClient from env vars, with Keychain fallback.
+
+    If ``ZOHO_PROFILE`` is set (e.g. ``rachel`` or ``vincent``), missing env
+    vars are looked up in the macOS Keychain under service
+    ``zoho-mail-<profile>``. This lets us register multiple MCP instances
+    pointing at the same ``server.py`` but different profiles, with zero
+    plaintext secrets in the MCP config or .env files.
+    """
+    profile = os.environ.get("ZOHO_PROFILE")
     token_cache = TokenCache(
-        client_id=os.environ["ZOHO_CLIENT_ID"],
-        client_secret=os.environ["ZOHO_CLIENT_SECRET"],
-        refresh_token=os.environ["ZOHO_REFRESH_TOKEN"],
+        client_id=_load_credential("CLIENT_ID", profile),
+        client_secret=_load_credential("CLIENT_SECRET", profile),
+        refresh_token=_load_credential("REFRESH_TOKEN", profile),
         accounts_url=os.environ.get("ZOHO_ACCOUNTS_URL", "https://accounts.zoho.com"),
     )
     return ZohoMailClient(

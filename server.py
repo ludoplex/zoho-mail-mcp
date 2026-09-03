@@ -1,18 +1,35 @@
-"""Zoho Mail MCP Server — 14 tools via FastMCP."""
+"""Zoho Mail MCP Server — 15 tools via FastMCP.
+
+Safety policy: this server cannot permanently destroy mail. "Delete" moves a
+message to Trash (reversible), Trashed mail can be restored, and the transport
+layer refuses permanent-delete / empty-folder operations outright.
+"""
 
 from __future__ import annotations
 
 import json
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Literal
+
+# Make imports work regardless of CWD (Claude may launch us from anywhere).
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from zoho_client import ZohoMailClient, create_client_from_env
+from zoho_client import (
+    UnrecoverableOperationError,
+    ZohoMailClient,
+    create_client_from_env,
+)
 
-load_dotenv()
+# Load .env from the server's own directory — not from the caller's CWD.
+load_dotenv(_HERE / ".env")
 
 _client: ZohoMailClient | None = None
 
@@ -210,6 +227,7 @@ async def zoho_create_draft(
     contentType: Literal["text/plain", "text/html"] = "text/plain",
     threadId: str = "",
     folderId: str = "",
+    attachments: list[str] | None = None,
 ) -> str:
     """Creates a new email draft that can be edited and sent later.
 
@@ -229,6 +247,10 @@ async def zoho_create_draft(
     - Provide threadId to create a draft reply within an existing thread
     - The subject is automatically derived from the thread when not provided
 
+    ATTACHMENTS:
+    - Pass local file paths in the attachments list; each file is uploaded to
+      Zoho's attachment store first, then referenced by the draft
+
     Args:
         body: Email body content (plain text or HTML based on contentType)
         to: Primary recipient email address(es). Can be omitted to save a draft without a recipient yet
@@ -238,8 +260,12 @@ async def zoho_create_draft(
         contentType: Content type of the email body — "text/plain" (default) or "text/html"
         threadId: Thread ID to reply to. When provided, the draft is created as a reply within that thread
         folderId: Optional folder ID to save the draft in
+        attachments: Optional list of local file paths to attach to the draft
     """
     assert _client is not None
+    attachment_meta: list[dict[str, Any]] = []
+    for file_path in attachments or []:
+        attachment_meta.extend(await _client.upload_attachment(file_path))
     result = await _client.create_draft(
         body,
         to=to,
@@ -249,6 +275,7 @@ async def zoho_create_draft(
         content_type=contentType,
         thread_id=threadId,
         folder_id=folderId,
+        attachments=attachment_meta or None,
     )
     return _fmt(result)
 
@@ -379,24 +406,60 @@ async def zoho_modify_message(
     return _fmt(result)
 
 
-# ── 13. Delete Message ────────────────────────────────────────────
+# ── 13. Delete Message (move to Trash — reversible) ───────────────
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True))
 async def zoho_delete_message(messageId: str, folderId: str) -> str:
-    """Deletes (trashes) an email message.
+    """Deletes a message by moving it to Trash. The delete is ALWAYS reversible.
+
+    This server cannot permanently delete mail. "Deleting" moves the message to
+    the Trash folder, from which it can be recovered with zoho_restore_message.
+
+    REFUSED CASES (returns a "refused" result, takes no action):
+    - The message is already in Trash. Re-deleting from Trash is how mail is
+      permanently destroyed, which is disabled. Restore it or let it expire.
 
     Args:
-        messageId: The ID of the message to delete
-        folderId: The folder ID containing the message
+        messageId: The ID of the message to delete (move to Trash)
+        folderId: The folder ID currently containing the message
     """
     assert _client is not None
-    result = await _client.delete_message(messageId, folderId)
+    try:
+        result = await _client.delete_message(messageId, folderId)
+    except UnrecoverableOperationError as exc:
+        return _fmt({"refused": True, "reason": str(exc)})
     return _fmt(result)
 
 
+# ── 14. Restore Message (move out of Trash) ───────────────────────
 
-# ── 14. Get Attachment ─────────────────────────────────────────────
+
+@mcp.tool()
+async def zoho_restore_message(
+    messageId: str, folderId: str, toFolderId: str = ""
+) -> str:
+    """Restores a message out of Trash (or any folder) back to the Inbox.
+
+    Use this to undo a delete or recover anything sitting in Trash. By default the
+    message is moved back to the Inbox; pass toFolderId to restore it elsewhere.
+
+    Args:
+        messageId: The ID of the message to restore
+        folderId: The folder ID currently containing the message (e.g. Trash)
+        toFolderId: Optional destination folder ID. Defaults to the Inbox when empty
+    """
+    assert _client is not None
+    try:
+        result = await _client.restore_message(
+            messageId, folderId, dest_folder_id=toFolderId or None
+        )
+    except UnrecoverableOperationError as exc:
+        return _fmt({"refused": True, "reason": str(exc)})
+    return _fmt(result)
+
+
+# ── 15. Get Attachment ─────────────────────────────────────────────
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
