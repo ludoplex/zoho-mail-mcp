@@ -18,6 +18,8 @@ MCP server for Zoho Mail — gives Claude (and any MCP client) full access to yo
 | `zoho_send_draft` | Send an existing draft | Write (destructive) |
 | `zoho_send_message` | Send an email | Write (destructive) |
 | `zoho_reply_to_message` | Reply / reply-all | Write (destructive) |
+| `zoho_list_scheduled` | List sends waiting in the Outbox (graceMinutes) | Read |
+| `zoho_cancel_scheduled` | Pull back a scheduled send before it is released | Write (reversible) |
 | `zoho_modify_message` | Mark read/star/move | Write (destructive, idempotent) |
 | `zoho_delete_message` | Delete (trash) an email | Write (destructive, idempotent) |
 

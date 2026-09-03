@@ -1,4 +1,4 @@
-"""Zoho Mail MCP Server — 15 tools via FastMCP.
+"""Zoho Mail MCP Server — 17 tools via FastMCP.
 
 Safety policy: this server cannot permanently destroy mail. "Delete" moves a
 message to Trash (reversible), Trashed mail can be restored, and the transport
@@ -284,7 +284,7 @@ async def zoho_create_draft(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True))
-async def zoho_send_draft(draftMessageId: str) -> str:
+async def zoho_send_draft(draftMessageId: str, graceMinutes: int = 0) -> str:
     """Sends an existing draft email immediately.
 
     Use this after zoho_create_draft to send a previously saved draft. The draft
@@ -301,9 +301,10 @@ async def zoho_send_draft(draftMessageId: str) -> str:
 
     Args:
         draftMessageId: The message ID of the draft to send (obtained from zoho_create_draft or zoho_list_drafts)
+        graceMinutes: 0 = send now. >0 = schedule the send that many minutes ahead; it waits in the Outbox and can be pulled back with zoho_cancel_scheduled(messageId) until then (the response's scheduled.messageId)
     """
     assert _client is not None
-    result = await _client.send_draft(draftMessageId)
+    result = await _client.send_draft(draftMessageId, grace_minutes=graceMinutes)
     return _fmt(result)
 
 
@@ -319,8 +320,9 @@ async def zoho_send_message(
     cc: str = "",
     bcc: str = "",
     contentType: Literal["text/plain", "text/html"] = "text/plain",
+    graceMinutes: int = 0,
 ) -> str:
-    """Composes and sends an email immediately.
+    """Composes and sends an email immediately (or, with graceMinutes, after a retractable delay).
 
     CONTENT TYPES:
     - text/plain: Simple text emails (default)
@@ -338,10 +340,12 @@ async def zoho_send_message(
         cc: Carbon copy recipients (comma-separated)
         bcc: Blind carbon copy recipients (comma-separated)
         contentType: Content type of the email body — "text/plain" (default) or "text/html"
+        graceMinutes: 0 = send now. >0 = schedule the send that many minutes ahead; it waits in the Outbox and can be pulled back with zoho_cancel_scheduled(messageId) until then (the response's scheduled.messageId)
     """
     assert _client is not None
     result = await _client.send_message(
-        to, subject, body, cc=cc, bcc=bcc, content_type=contentType
+        to, subject, body, cc=cc, bcc=bcc, content_type=contentType,
+        grace_minutes=graceMinutes,
     )
     return _fmt(result)
 
@@ -359,6 +363,7 @@ async def zoho_reply_to_message(
     bcc: str = "",
     contentType: Literal["text/plain", "text/html"] = "text/plain",
     replyAll: bool = False,
+    graceMinutes: int = 0,
 ) -> str:
     """Replies to an existing email message. Set replyAll=true for reply-all.
 
@@ -371,11 +376,13 @@ async def zoho_reply_to_message(
         bcc: Blind carbon copy recipients (comma-separated)
         contentType: Content type — "text/plain" (default) or "text/html"
         replyAll: Set to true to reply to all recipients (default: false)
+        graceMinutes: 0 = send now. >0 = schedule the send that many minutes ahead; it waits in the Outbox and can be pulled back with zoho_cancel_scheduled(messageId) until then (the response's scheduled.messageId)
     """
     assert _client is not None
     result = await _client.reply_to_message(
         messageId, folderId, body,
         to=to, cc=cc, bcc=bcc, content_type=contentType, reply_all=replyAll,
+        grace_minutes=graceMinutes,
     )
     return _fmt(result)
 
@@ -464,7 +471,47 @@ async def zoho_restore_message(
     return _fmt(result)
 
 
-# ── 15. Get Attachment ─────────────────────────────────────────────
+# ── 15. List Scheduled (Outbox) ───────────────────────────────────
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+async def zoho_list_scheduled(maxResults: int = 20, start: int = 0) -> str:
+    """Lists messages waiting in the Outbox — sends made with graceMinutes that have
+    not been released yet. Each can still be cancelled with zoho_cancel_scheduled.
+
+    Args:
+        maxResults: Maximum messages to return (default: 20)
+        start: Offset for pagination (default: 0)
+    """
+    assert _client is not None
+    return _fmt(await _client.list_scheduled(max_results=maxResults, start=start))
+
+
+# ── 16. Cancel Scheduled ──────────────────────────────────────────
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+async def zoho_cancel_scheduled(messageId: str) -> str:
+    """Pulls back a scheduled (graceMinutes) send before it is released.
+
+    The message is moved from the Outbox to Trash, which is reversible and
+    prevents delivery. Use the scheduled.messageId returned by zoho_send_message,
+    zoho_send_draft or zoho_reply_to_message, or an id from zoho_list_scheduled.
+    Once the schedule time has passed the message has been sent and cannot be
+    recalled for recipients outside the organization.
+
+    Args:
+        messageId: The Outbox message ID to cancel
+    """
+    assert _client is not None
+    try:
+        result = await _client.cancel_scheduled(messageId)
+    except UnrecoverableOperationError as exc:
+        return _fmt({"refused": True, "reason": str(exc)})
+    return _fmt(result)
+
+
+# ── 17. Get Attachment ─────────────────────────────────────────────
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))

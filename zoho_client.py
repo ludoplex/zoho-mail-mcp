@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import html
 import os
+from datetime import datetime, timedelta
 from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -15,6 +17,48 @@ from zoho_auth import TokenCache
 # System folder names used for safe-delete (move-to-Trash) and restore.
 TRASH_FOLDER_NAME = "Trash"
 INBOX_FOLDER_NAME = "Inbox"
+OUTBOX_FOLDER_NAME = "Outbox"
+DEFAULT_TIMEZONE = os.environ.get("ZOHO_TIMEZONE", "America/Denver")
+
+
+def _schedule_fields(
+    grace_minutes: int, time_zone: str | None = None, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Zoho scheduled-send fields for a retractable grace window.
+
+    A scheduled message parks in the Outbox until ``scheduleTime`` and can be
+    pulled back by moving it to Trash (``cancel_scheduled``). Zoho accepts the
+    IANA zone id (``America/Denver``) in ``timeZone``; the "GMT 5:30 (...)"
+    form shown in its docs is rejected (verified 2026-09-02). Returns ``{}``
+    when ``grace_minutes`` <= 0 so callers can ``payload.update(...)`` blindly.
+    """
+    if grace_minutes <= 0:
+        return {}
+    zone = ZoneInfo(time_zone or DEFAULT_TIMEZONE)
+    base = (now or datetime.now(zone)).astimezone(zone)
+    when = base + timedelta(minutes=grace_minutes)
+    return {
+        "isSchedule": True,
+        "scheduleType": 6,
+        "timeZone": zone.key,
+        "scheduleTime": when.strftime("%m/%d/%Y %H:%M:%S"),
+    }
+
+
+def _with_schedule_info(result: dict[str, Any], fields: dict[str, Any], grace_minutes: int) -> dict[str, Any]:
+    if not fields:
+        return result
+    data = result.get("data", {}) if isinstance(result, dict) else {}
+    return {
+        **result,
+        "scheduled": {
+            "graceMinutes": grace_minutes,
+            "scheduleTime": fields["scheduleTime"],
+            "timeZone": fields["timeZone"],
+            "messageId": data.get("messageId"),
+            "cancelWith": "zoho_cancel_scheduled(messageId) before scheduleTime; the message sits in Outbox until then",
+        },
+    }
 
 
 class UnrecoverableOperationError(RuntimeError):
@@ -466,7 +510,12 @@ class ZohoMailClient:
         )
 
     async def send_draft(
-        self, draft_message_id: str, *, delete_after_send: bool = True
+        self,
+        draft_message_id: str,
+        *,
+        delete_after_send: bool = True,
+        grace_minutes: int = 0,
+        time_zone: str | None = None,
     ) -> dict[str, Any]:
         """Send a saved draft.
 
@@ -537,6 +586,8 @@ class ZohoMailClient:
             descriptors.extend(got if isinstance(got, list) else [got])
         if descriptors:
             payload["attachments"] = descriptors
+        sched = _schedule_fields(grace_minutes, time_zone)
+        payload.update(sched)
 
         result = await self._request(
             "POST", f"/api/accounts/{account_id}/messages", json_body=payload
@@ -545,7 +596,9 @@ class ZohoMailClient:
         if delete_after_send:
             await self.delete_message(draft_message_id, drafts_folder_id)
             moved = True
-        return {**result, "draftMessageId": draft_message_id, "draftMovedToTrash": moved}
+        return _with_schedule_info(
+            {**result, "draftMessageId": draft_message_id, "draftMovedToTrash": moved}, sched, grace_minutes
+        )
 
     # ── Send & Reply ───────────────────────────────────────────────
 
@@ -558,10 +611,17 @@ class ZohoMailClient:
         cc: str = "",
         bcc: str = "",
         content_type: str = "text/plain",
+        grace_minutes: int = 0,
+        time_zone: str | None = None,
     ) -> dict[str, Any]:
+        """Send an email. ``grace_minutes`` > 0 schedules it that far ahead instead
+        of sending immediately, leaving it in the Outbox where ``cancel_scheduled``
+        can still pull it back."""
         account_id = await self._ensure_account_id()
+        from_addr = await self._ensure_from_address()  # Zoho 500s on scheduled sends without it
         is_html = content_type == "text/html"
         payload: dict[str, Any] = {
+            "fromAddress": from_addr,
             "toAddress": to,
             "subject": subject,
             "content": body,
@@ -571,9 +631,12 @@ class ZohoMailClient:
             payload["ccAddress"] = cc
         if bcc:
             payload["bccAddress"] = bcc
-        return await self._request(
+        sched = _schedule_fields(grace_minutes, time_zone)
+        payload.update(sched)
+        result = await self._request(
             "POST", f"/api/accounts/{account_id}/messages", json_body=payload
         )
+        return _with_schedule_info(result, sched, grace_minutes)
 
     async def reply_to_message(
         self,
@@ -586,6 +649,8 @@ class ZohoMailClient:
         bcc: str = "",
         content_type: str = "text/plain",
         reply_all: bool = False,
+        grace_minutes: int = 0,
+        time_zone: str | None = None,
     ) -> dict[str, Any]:
         """Reply to a message.
 
@@ -640,9 +705,35 @@ class ZohoMailClient:
             payload["ccAddress"] = ", ".join(cc_list)
         if bcc:
             payload["bccAddress"] = bcc
-        return await self._request(
+        sched = _schedule_fields(grace_minutes, time_zone)
+        payload.update(sched)
+        result = await self._request(
             "POST", f"/api/accounts/{account_id}/messages/{message_id}", json_body=payload
         )
+        return _with_schedule_info(result, sched, grace_minutes)
+
+    # ── Scheduled (grace-window) sends ─────────────────────────────
+
+    async def list_scheduled(self, *, max_results: int = 20, start: int = 0) -> dict[str, Any]:
+        """List messages waiting in the Outbox (scheduled sends not yet released)."""
+        account_id = await self._ensure_account_id()
+        outbox_id = await self._resolve_folder_id(OUTBOX_FOLDER_NAME)
+        if not outbox_id:
+            return {"status": {"code": 200}, "data": []}
+        return await self._request(
+            "GET",
+            f"/api/accounts/{account_id}/messages/view",
+            params={"folderId": outbox_id, "limit": max_results, "start": start},
+        )
+
+    async def cancel_scheduled(self, message_id: str) -> dict[str, Any]:
+        """Pull a scheduled message back before it is released: move it from the
+        Outbox to Trash (reversible). Verified 2026-09-02 - the message never sends."""
+        outbox_id = await self._resolve_folder_id(OUTBOX_FOLDER_NAME)
+        if not outbox_id:
+            raise RuntimeError("Could not resolve the Outbox folder")
+        result = await self.delete_message(message_id, outbox_id)
+        return {**result, "cancelledMessageId": message_id, "movedToTrash": True}
 
     # ── Attachments ────────────────────────────────────────────────
 

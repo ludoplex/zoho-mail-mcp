@@ -271,6 +271,7 @@ async def test_create_draft_with_attachments(client, mock_api):
 
 @pytest.mark.asyncio
 async def test_send_message(client, mock_api):
+    _mock_profile(mock_api)
     mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
         json={"status": {"code": 200}, "data": {"messageId": "s1"}}
     )
@@ -280,6 +281,7 @@ async def test_send_message(client, mock_api):
 
 @pytest.mark.asyncio
 async def test_send_message_html(client, mock_api):
+    _mock_profile(mock_api)
     mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
         json={"status": {"code": 200}, "data": {"messageId": "s2"}}
     )
@@ -340,6 +342,95 @@ async def test_reply_keeps_existing_re_prefix_and_to_override(client, mock_api):
     await client.reply_to_message("m1", "f1", "<p>x</p>", to="zed@example.com", content_type="text/html")
     sent = json.loads(route.calls.last.request.content)
     assert sent["subject"] == "RE: hello" and sent["toAddress"] == "zed@example.com" and sent["mailFormat"] == "html"
+
+
+# ── grace window (scheduled send) ─────────────────────────────────
+def test_schedule_fields_format():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from zoho_client import _schedule_fields
+    now = datetime(2026, 9, 2, 22, 0, 0, tzinfo=ZoneInfo("America/Denver"))
+    f = _schedule_fields(10, "America/Denver", now=now)
+    assert f == {"isSchedule": True, "scheduleType": 6, "timeZone": "America/Denver", "scheduleTime": "09/02/2026 22:10:00"}
+    assert _schedule_fields(0, "America/Denver", now=now) == {}
+    # a different zone converts the instant, never just relabels it
+    f2 = _schedule_fields(10, "UTC", now=now)
+    assert f2["timeZone"] == "UTC" and f2["scheduleTime"] == "09/03/2026 04:10:00"
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_grace_minutes(client, mock_api):
+    _mock_profile(mock_api)
+    route = mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
+        json={"status": {"code": 200}, "data": {"messageId": "o1", "scheduleType": "6"}}
+    )
+    result = await client.send_message("to@example.com", "Subject", "Body", grace_minutes=15, time_zone="America/Denver")
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["isSchedule"] is True and sent["scheduleType"] == 6 and sent["timeZone"] == "America/Denver"
+    assert "scheduleTime" in sent
+    assert result["scheduled"]["graceMinutes"] == 15
+    assert result["scheduled"]["messageId"] == "o1"
+    assert "zoho_cancel_scheduled" in result["scheduled"]["cancelWith"]
+
+
+@pytest.mark.asyncio
+async def test_send_message_without_grace_has_no_schedule(client, mock_api):
+    _mock_profile(mock_api)
+    route = mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages").respond(
+        json={"status": {"code": 200}, "data": {"messageId": "s1"}}
+    )
+    result = await client.send_message("to@example.com", "Subject", "Body")
+    assert "isSchedule" not in json.loads(route.calls.last.request.content)
+    assert "scheduled" not in result
+
+
+@pytest.mark.asyncio
+async def test_reply_with_grace_minutes(client, mock_api):
+    route = _mock_original_m1(mock_api)
+    await client.reply_to_message("m1", "f1", "Reply body", grace_minutes=5)
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["action"] == "reply" and sent["isSchedule"] is True and sent["scheduleType"] == 6
+
+
+@pytest.mark.asyncio
+async def test_send_draft_with_grace_minutes(client, mock_api):
+    upload, send, trash = _mock_draft_d1(mock_api)
+    result = await client.send_draft("d1", grace_minutes=10)
+    sent = json.loads(send.calls.last.request.content)
+    assert sent["isSchedule"] is True and sent["scheduleType"] == 6
+    assert trash.called and result["draftMovedToTrash"] is True
+    assert result["scheduled"]["graceMinutes"] == 10
+
+
+def _mock_outbox(mock_api):
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders").respond(
+        json={"status": {"code": 200}, "data": [
+            {"folderId": "400", "folderName": "Outbox", "folderType": "Outbox"},
+            {"folderId": "300", "folderName": "Trash", "folderType": "Trash"},
+        ]}
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_scheduled_reads_outbox(client, mock_api):
+    _mock_outbox(mock_api)
+    view = mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/view").respond(
+        json={"status": {"code": 200}, "data": [{"messageId": "o1", "subject": "queued"}]}
+    )
+    result = await client.list_scheduled()
+    assert result["data"][0]["messageId"] == "o1"
+    assert view.calls.last.request.url.params["folderId"] == "400"
+
+
+@pytest.mark.asyncio
+async def test_cancel_scheduled_moves_outbox_message_to_trash(client, mock_api):
+    _mock_outbox(mock_api)
+    move = mock_api.put(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/updatemessage").respond(
+        json={"status": {"code": 200}}
+    )
+    result = await client.cancel_scheduled("o1")
+    assert json.loads(move.calls.last.request.content) == {"mode": "moveMessage", "destfolderId": "300", "messageId": ["o1"]}
+    assert result["cancelledMessageId"] == "o1" and result["movedToTrash"] is True
 
 
 @pytest.mark.asyncio
