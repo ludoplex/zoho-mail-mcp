@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import os
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
 
@@ -586,24 +587,61 @@ class ZohoMailClient:
         content_type: str = "text/plain",
         reply_all: bool = False,
     ) -> dict[str, Any]:
+        """Reply to a message.
+
+        Zoho's documented call is ``POST /messages/{id}`` with ``action=reply`` (the
+        old ``/folders/{fid}/messages/{mid}/reply[all]`` routes 404 — verified
+        2026-09-02). There is no reply-all action, so recipients are derived from the
+        original's ``/details``: To = the original sender (or ``to`` override);
+        with ``reply_all`` every original To/Cc address except our own and the sender
+        is added to Cc, plus any ``cc`` given.
+        """
         account_id = await self._ensure_account_id()
+        from_addr = await self._ensure_from_address()
+        details = (await self._request(
+            "GET", f"/api/accounts/{account_id}/folders/{folder_id}/messages/{message_id}/details"
+        )).get("data", {})
+
+        def _addrs(field: str) -> list[str]:
+            raw = str(details.get(field, "") or "")
+            if not raw or raw == "Not Provided":
+                return []
+            return [a for _, a in getaddresses([html.unescape(raw)]) if a]
+
+        sender = _addrs("fromAddress")
+        to_addr = to or (sender[0] if sender else "")
+        if not to_addr:
+            raise ValueError(f"Cannot determine a recipient for reply to message {message_id}")
+
+        cc_list: list[str] = []
+        if reply_all:
+            skip = {from_addr.lower(), to_addr.lower()}
+            for a in _addrs("toAddress") + _addrs("ccAddress"):
+                if a.lower() not in skip and a.lower() not in {c.lower() for c in cc_list}:
+                    cc_list.append(a)
+        for a in [c.strip() for c in cc.split(",") if c.strip()]:
+            if a.lower() not in {c.lower() for c in cc_list} and a.lower() != to_addr.lower():
+                cc_list.append(a)
+
+        subject = html.unescape(str(details.get("subject", "") or ""))
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}".strip()
+
         is_html = content_type == "text/html"
         payload: dict[str, Any] = {
+            "fromAddress": from_addr,
+            "toAddress": to_addr,
+            "subject": subject,
             "content": body,
             "mailFormat": "html" if is_html else "plaintext",
+            "action": "reply",
         }
-        if to:
-            payload["toAddress"] = to
-        if cc:
-            payload["ccAddress"] = cc
+        if cc_list:
+            payload["ccAddress"] = ", ".join(cc_list)
         if bcc:
             payload["bccAddress"] = bcc
-
-        action = "replyall" if reply_all else "reply"
         return await self._request(
-            "POST",
-            f"/api/accounts/{account_id}/folders/{folder_id}/messages/{message_id}/{action}",
-            json_body=payload,
+            "POST", f"/api/accounts/{account_id}/messages/{message_id}", json_body=payload
         )
 
     # ── Attachments ────────────────────────────────────────────────

@@ -289,22 +289,57 @@ async def test_send_message_html(client, mock_api):
     assert result["data"]["messageId"] == "s2"
 
 
-@pytest.mark.asyncio
-async def test_reply_to_message(client, mock_api):
-    mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/f1/messages/m1/reply").respond(
+def _mock_original_m1(mock_api):
+    """Zoho reply = POST /messages/{id} with action=reply (no reply-all endpoint exists);
+    recipients come from the original message's /details."""
+    _mock_profile(mock_api)  # fromAddress for the reply
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/f1/messages/m1/details").respond(
+        json={"status": {"code": 200}, "data": {
+            "messageId": "m1", "fromAddress": "alice@example.com", "sender": "Alice",
+            "toAddress": "&quot;Me&quot;&lt;test@example.com&gt;, bob@example.com",
+            "ccAddress": "carol@example.com", "subject": "Quote &amp; terms",
+        }}
+    )
+    return mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/messages/m1").respond(
         json={"status": {"code": 200}, "data": {"messageId": "r1"}}
     )
+
+
+@pytest.mark.asyncio
+async def test_reply_to_message(client, mock_api):
+    route = _mock_original_m1(mock_api)
     result = await client.reply_to_message("m1", "f1", "Reply body")
     assert result["data"]["messageId"] == "r1"
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["action"] == "reply"
+    assert sent["fromAddress"] == "test@example.com"
+    assert sent["toAddress"] == "alice@example.com"        # original sender
+    assert sent["subject"] == "Re: Quote & terms"           # entities decoded, Re: added once
+    assert sent["content"] == "Reply body" and sent["mailFormat"] == "plaintext"
+    assert "ccAddress" not in sent
 
 
 @pytest.mark.asyncio
 async def test_reply_all(client, mock_api):
-    mock_api.post(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/f1/messages/m1/replyall").respond(
-        json={"status": {"code": 200}, "data": {"messageId": "ra1"}}
+    route = _mock_original_m1(mock_api)
+    result = await client.reply_to_message("m1", "f1", "Reply all body", reply_all=True, cc="dave@example.com")
+    assert result["data"]["messageId"] == "r1"
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["action"] == "reply"
+    assert sent["toAddress"] == "alice@example.com"
+    # everyone on the original except me and the sender, plus the caller's cc, no duplicates
+    assert sent["ccAddress"] == "bob@example.com, carol@example.com, dave@example.com"
+
+
+@pytest.mark.asyncio
+async def test_reply_keeps_existing_re_prefix_and_to_override(client, mock_api):
+    route = _mock_original_m1(mock_api)
+    mock_api.get(f"{MAIL_BASE}/api/accounts/{FAKE_ACCOUNT_ID}/folders/f1/messages/m1/details").respond(
+        json={"status": {"code": 200}, "data": {"fromAddress": "alice@example.com", "toAddress": "test@example.com", "ccAddress": "Not Provided", "subject": "RE: hello"}}
     )
-    result = await client.reply_to_message("m1", "f1", "Reply all body", reply_all=True)
-    assert result["data"]["messageId"] == "ra1"
+    await client.reply_to_message("m1", "f1", "<p>x</p>", to="zed@example.com", content_type="text/html")
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["subject"] == "RE: hello" and sent["toAddress"] == "zed@example.com" and sent["mailFormat"] == "html"
 
 
 @pytest.mark.asyncio
