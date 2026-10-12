@@ -16,6 +16,15 @@ ACCOUNTS_URL = "https://accounts.zoho.com"
 MAIL_BASE = "https://mail.zoho.com"
 
 
+@pytest.fixture(autouse=True)
+def token_cache_dir(tmp_path, monkeypatch):
+    """Point the shared on-disk token cache at a per-test directory."""
+    path = tmp_path / "zoho-mail-tokens"
+    monkeypatch.setenv("ZOHO_TOKEN_CACHE_DIR", str(path))
+    monkeypatch.delenv("ZOHO_TOKEN_CACHE", raising=False)
+    return path
+
+
 @pytest.fixture()
 def mock_api():
     """Activate respx for the test and pre-configure the token refresh endpoint."""
