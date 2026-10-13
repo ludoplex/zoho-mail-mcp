@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import html
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta
 from email.utils import getaddresses
 from pathlib import Path
@@ -768,32 +770,56 @@ class ZohoMailClient:
 
 
 def _load_credential(key: str, profile: str | None) -> str:
-    """Resolve a credential, preferring env vars, falling back to macOS Keychain.
+    """Resolve a credential, preferring env vars, falling back to the macOS Keychain.
 
     Resolution order:
-      1. Environment variable (e.g. ``ZOHO_CLIENT_ID``) — set by caller or .env
-      2. macOS Keychain service ``zoho-mail-<profile>`` with account ``key``
+      1. Environment variable (e.g. ``ZOHO_CLIENT_ID``) - set by caller or .env
+      2. OS keyring (``keyring``), service ``zoho-mail-<profile>``, account ``key``
+      3. macOS only: ``/usr/bin/security find-generic-password`` for the same item. A keychain item trusts
+         the Python binary that first read it; after a Python upgrade (new code signature) ``keyring`` gets
+         errSecInteractionNotAllowed (-25308) in a non-interactive session while the Apple-signed
+         ``security`` tool still reads it (Homebrew python@3.14 3.14.8_2, 2026-10-12).
 
-    Raises ``KeyError`` if neither source has a value.
+    Raises ``KeyError`` if no source has a value. The value is never logged.
     """
     env_val = os.environ.get(f"ZOHO_{key}")
     if env_val:
         return env_val
 
     if profile:
+        service = f"zoho-mail-{profile}"
         try:
             import keyring
 
-            val = keyring.get_password(f"zoho-mail-{profile}", key)
+            val = keyring.get_password(service, key)
             if val:
                 return val
-        except ImportError:
-            pass  # keyring not installed — fall through to error
+        except Exception:  # ImportError, or keyring.errors.KeyringError (-25308 after a Python upgrade)
+            pass
+        val = _security_cli_secret(service, key)
+        if val:
+            return val
 
     raise KeyError(
         f"ZOHO_{key} not found. Set env var ZOHO_{key} or store in Keychain "
         f"under service 'zoho-mail-{profile or '<profile>'}' account '{key}'."
     )
+
+
+SECURITY_CLI = "/usr/bin/security"
+
+
+def _security_cli_secret(service: str, account: str) -> str | None:
+    """macOS: read a generic password with the Apple ``security`` tool; ``None`` on any failure (no output)."""
+    if sys.platform != "darwin" or not os.path.exists(SECURITY_CLI):
+        return None
+    try:
+        r = subprocess.run([SECURITY_CLI, "find-generic-password", "-s", service, "-a", account, "-w"],
+                           capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    val = r.stdout.rstrip("\n") if r.returncode == 0 else ""
+    return val or None
 
 
 def create_client_from_env() -> ZohoMailClient:
